@@ -1,0 +1,21 @@
+# Ignore Virtual Environment (DO NOT PUSH THIS)
+venv/
+ENV/
+env/
+
+# Ignore Temporary Audio & Screenshot Files
+*.wav
+*.mp3
+Screenshots/
+
+# Ignore Local Configs & Personal Memories (Contains private data/keys)
+config.json
+memory.json
+
+# Ignore Python Cache & Build Files
+__pycache__/
+*.pyc
+
+# Ignore OS system files
+.DS_Store
+Thumbs.db
