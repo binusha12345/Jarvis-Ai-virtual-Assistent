@@ -9,6 +9,7 @@ import asyncio
 import subprocess
 import webbrowser
 import ctypes
+from urllib.parse import quote
 import numpy as np
 import sounddevice as sd
 import speech_recognition as sr
@@ -16,49 +17,84 @@ import edge_tts
 import ollama
 import pygame
 
-# PC Control Libraries
+# Hardware & System Automation Libraries
 import psutil
 import pyautogui
 
+try:
+    import pywhatkit
+    HAS_PYWHATKIT = True
+except ImportError:
+    HAS_PYWHATKIT = False
+
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
+
 # ──────────────────────────────────────────────
-# UTF-8 DISPLAY FIX
+# UTF-8 TERMINAL DISPLAY FIX
 # ──────────────────────────────────────────────
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
 # ──────────────────────────────────────────────
-# CONFIGURATION & CONSTANTS
+# PATHS & CONFIGURATION
 # ──────────────────────────────────────────────
 BASE_DIR = r"D:\JARVIS"
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
+AUDIO_INPUT = os.path.join(BASE_DIR, "input.wav")
+
 LOCAL_MODEL = "qwen2.5:1.5b"
-
 SAMPLE_RATE = 16000
-WAKE_WORDS = ["jarvis", "jarvice", "javis", "javi", "travis", "hello", "hi"]
-CONVERSATION_TIMEOUT = 12
+CONVERSATION_TIMEOUT = 14
 
-CHUNK_SIZE = 1600             # 100ms
+CHUNK_SIZE = 1600
 ENERGY_THRESHOLD = 350
-SILENCE_CHUNKS_LIMIT = 5      # 0.5s cutoff
-
-# 🔑 GLOBAL SYSTEM PROMPT (Defined First)
-SYSTEM_PROMPT = (
-    "You are JARVIS, Tony Stark's personal AI assistant from Iron Man. "
-    "1. Speak in crisp, polite British English. "
-    "2. Always address the user as 'Sir'. "
-    "3. Keep responses under 10 words (1 short sentence). "
-    "4. Never use markdown, asterisks (*), emojis, or thinking tags."
-)
-
-recognizer = sr.Recognizer()
-pygame.mixer.init(frequency=24000, size=-16, channels=1)
+SILENCE_CHUNKS_LIMIT = 5
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1
 
+recognizer = sr.Recognizer()
+pygame.mixer.init(frequency=24000, size=-16, channels=1)
+
 # ──────────────────────────────────────────────
-# 🧠 PERSISTENT MEMORY ENGINE (`memory.json`)
+# ⚙️ DYNAMIC SYSTEM CONFIG & IDENTITY STATE
+# ──────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "assistant_name": "JARVIS",
+    "user_title": "Sir",
+    "wake_words": ["jarvis", "jarvice", "javis", "javi", "travis", "hello", "hi", "binusha"],
+    "voice_rate": "+10%",
+    "groq_api_key": ""
+}
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                # Merge defaults for any missing keys
+                for k, v in DEFAULT_CONFIG.items():
+                    cfg.setdefault(k, v)
+                return cfg
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    os.makedirs(BASE_DIR, exist_ok=True)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+SYS_CONFIG = load_config()
+
+# ──────────────────────────────────────────────
+# 🧠 PERMANENT KNOWLEDGE GRAPH & MEMORY
 # ──────────────────────────────────────────────
 def load_memories():
     if os.path.exists(MEMORY_FILE):
@@ -76,148 +112,169 @@ def save_memory(key, value):
     with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(memories, f, ensure_ascii=False, indent=2)
 
-def clear_memories():
-    if os.path.exists(MEMORY_FILE):
-        os.remove(MEMORY_FILE)
-    return "All memories cleared from disk, Sir."
-
-def get_memory_context():
+def delete_memory(key):
     memories = load_memories()
-    if not memories:
-        return "No saved user memories yet."
-    mem_str = "USER MEMORIES & FACTS:\n"
-    for k, v in memories.items():
-        mem_str += f"- {k}: {v}\n"
-    return mem_str
+    if key in memories:
+        del memories[key]
+        with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(memories, f, ensure_ascii=False, indent=2)
 
-def build_dynamic_system_prompt():
-    mem_ctx = get_memory_context()
+def build_system_prompt():
+    memories = load_memories()
+    mem_context = ""
+    if memories:
+        mem_context = "STORED USER FACTS & PREFERENCES:\n" + "\n".join([f"- {k}: {v}" for k, v in memories.items()])
+    else:
+        mem_context = "No stored user memories yet."
+
+    name = SYS_CONFIG["assistant_name"]
+    title = SYS_CONFIG["user_title"]
+
     return (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"DYNAMIC SYSTEM CONTEXT:\n"
-        f"{mem_ctx}"
+        f"You are {name}, an industrial-grade AI assistant inspired by Iron Man's JARVIS. "
+        f"1. Address the user as '{title}'. "
+        f"2. Keep responses concise, intelligent, and under 15 words. "
+        f"3. Speak in crisp, polite British English. "
+        f"4. Never use markdown, asterisks (*), emojis, or thinking tags.\n\n"
+        f"{mem_context}"
     )
 
 # ──────────────────────────────────────────────
-# 🛡️ UNIVERSAL 2-STEP CONFIRMATION PROTOCOL
+# 🧹 COMMAND SANITIZER
 # ──────────────────────────────────────────────
-pending_action_func = None
-pending_action_desc = ""
-pending_action_expiry = 0
-
-def register_pending_action(action_func, description):
-    global pending_action_func, pending_action_desc, pending_action_expiry
-    pending_action_func = action_func
-    pending_action_desc = description
-    pending_action_expiry = time.time() + 14  # 14-second confirmation window
-    return f"Are you sure you want me to {description}, Sir? Say 'Confirm' or 'Yes' to proceed."
-
-# ──────────────────────────────────────────────
-# 🧹 SENTENCE CLEANER (Strips Filler Words)
-# ──────────────────────────────────────────────
-def clean_sentence(text):
-    cmd = text.lower().strip()
+def sanitize_command(raw_text):
+    cmd = raw_text.lower().strip()
     
-    # Remove wake word
-    for w in WAKE_WORDS:
+    # Strip wake words
+    for w in SYS_CONFIG["wake_words"]:
         cmd = re.sub(r'\b' + re.escape(w) + r'\b', '', cmd)
-        
-    # Remove courtesy/filler words
+
+    # Strip conversational courtesy fillers
     fillers = [
         "please", "can you", "could you", "would you", "kindly",
-        "i want you to", "i want to", "go ahead and", "tell me",
-        "for me", "app", "application"
+        "i want you to", "i want to", "go ahead and", "for me", "app", "application"
     ]
     for f in fillers:
         cmd = cmd.replace(f, "")
-        
+
     return cmd.strip(" ,.?!:;")
 
 # ──────────────────────────────────────────────
-# ⏱️ REAL SYSTEM TIME & DATE
+# 💻 OS CONTROL & AUTOMATION ENGINE
 # ──────────────────────────────────────────────
-def get_real_time():
-    now = datetime.datetime.now()
-    return f"The time is currently {now.strftime('%I:%M %p')}, Sir."
+def do_change_identity(new_name):
+    SYS_CONFIG["assistant_name"] = new_name.capitalize()
+    # Add new name to wake words if not present
+    new_wake = new_name.lower()
+    if new_wake not in SYS_CONFIG["wake_words"]:
+        SYS_CONFIG["wake_words"].append(new_wake)
+    save_config(SYS_CONFIG)
+    return f"My name has been updated to {SYS_CONFIG['assistant_name']}, {SYS_CONFIG['user_title']}."
 
-def get_real_date():
-    now = datetime.datetime.now()
-    return f"Today is {now.strftime('%A, %B %d, %Y')}, Sir."
+def do_change_user_title(new_title):
+    SYS_CONFIG["user_title"] = new_title.capitalize()
+    save_config(SYS_CONFIG)
+    return f"I will address you as {SYS_CONFIG['user_title']} from now on."
 
-# ──────────────────────────────────────────────
-# 🦾 UNIVERSAL APP & PC LAUNCHER
-# ──────────────────────────────────────────────
-def do_open_app(raw_app_name):
-    """Launches UWP Apps, Desktop Executables, and Photoshop/Installed Apps"""
-    app = raw_app_name.lower().strip()
-    
+def do_open_app(raw_target):
+    target = raw_target.lower().strip()
     try:
-        if "camera" in app:
+        if "camera" in target:
             os.system("start microsoft.windows.camera:")
-            return "Camera is now open, Sir."
-        elif "calculator" in app or "calc" in app:
+            return f"Camera opened, {SYS_CONFIG['user_title']}."
+        elif "calculator" in target or "calc" in target:
             subprocess.Popen("calc.exe")
-            return "Calculator is now open, Sir."
-        elif "notepad" in app:
+            return f"Calculator opened, {SYS_CONFIG['user_title']}."
+        elif "notepad" in target:
             subprocess.Popen("notepad.exe")
-            return "Notepad is now open, Sir."
-        elif "settings" in app:
+            return f"Notepad opened, {SYS_CONFIG['user_title']}."
+        elif "settings" in target:
             os.system("start ms-settings:")
-            return "Windows Settings opened, Sir."
-        elif "task manager" in app:
+            return f"Windows Settings opened, {SYS_CONFIG['user_title']}."
+        elif "task manager" in target:
             subprocess.Popen("taskmgr.exe")
-            return "Task Manager opened, Sir."
-        elif "file explorer" in app or "explorer" in app or "my computer" in app:
+            return f"Task Manager opened, {SYS_CONFIG['user_title']}."
+        elif "explorer" in target or "file explorer" in target:
             subprocess.Popen("explorer.exe")
-            return "File Explorer opened, Sir."
-        elif "youtube" in app:
+            return f"File Explorer opened, {SYS_CONFIG['user_title']}."
+        elif "youtube" in target:
             webbrowser.open("https://www.youtube.com")
-            return "YouTube opened in browser, Sir."
-        elif "chrome" in app or "browser" in app or "google" in app:
+            return f"YouTube opened, {SYS_CONFIG['user_title']}."
+        elif "chrome" in target or "browser" in target:
             webbrowser.open("https://www.google.com")
-            return "Browser opened, Sir."
-        elif "cmd" in app or "terminal" in app or "command prompt" in app:
-            subprocess.Popen("cmd.exe")
-            return "Command Prompt opened, Sir."
+            return f"Browser opened, {SYS_CONFIG['user_title']}."
         else:
-            # Universal Windows Start Search for Photoshop, WhatsApp, Spotify, Premiere, Games, etc.
             pyautogui.press('win')
             time.sleep(0.3)
-            pyautogui.write(app, interval=0.03)
+            pyautogui.write(target, interval=0.03)
             time.sleep(0.4)
             pyautogui.press('enter')
-            return f"Launching {raw_app_name}, Sir."
-    except Exception as e:
-        return f"Failed to open {raw_app_name}, Sir."
-
-def do_type_text(text_to_type):
-    try:
-        pyautogui.write(text_to_type, interval=0.02)
-        return "Typed the text, Sir."
+            return f"Launching {raw_target}, {SYS_CONFIG['user_title']}."
     except Exception:
-        return "Failed to type text, Sir."
+        return f"Failed to launch {raw_target}, {SYS_CONFIG['user_title']}."
 
-def do_press_key(key_name):
-    try:
-        pyautogui.press(key_name)
-        return f"Pressed {key_name}, Sir."
-    except Exception:
-        return f"Failed to press {key_name}, Sir."
+def do_kill_process(proc_name):
+    killed = False
+    clean_p = proc_name.lower().strip()
+    for proc in psutil.process_iter(['name']):
+        try:
+            if clean_p in proc.info['name'].lower():
+                proc.kill()
+                killed = True
+        except Exception:
+            pass
+    if killed:
+        return f"Terminated process {proc_name}, {SYS_CONFIG['user_title']}."
+    return f"Could not find running process {proc_name}, {SYS_CONFIG['user_title']}."
 
-def do_hotkey(key1, key2):
+def do_camera_snap():
     try:
-        pyautogui.hotkey(key1, key2)
-        return "Command executed, Sir."
+        os.system("start microsoft.windows.camera:")
+        time.sleep(2.5)
+        pyautogui.press('space')
+        return f"Camera launched and photo captured, {SYS_CONFIG['user_title']}."
     except Exception:
-        return "Failed to execute command, Sir."
+        return f"Camera capture failed, {SYS_CONFIG['user_title']}."
 
-def do_scroll(direction):
+def do_play_youtube(query):
     try:
-        amount = -600 if direction == "down" else 600
-        pyautogui.scroll(amount)
-        return f"Scrolled {direction}, Sir."
+        if HAS_PYWHATKIT:
+            pywhatkit.playonyt(query)
+            return f"Playing {query} on YouTube, {SYS_CONFIG['user_title']}."
+        else:
+            webbrowser.open(f"https://www.youtube.com/results?search_query={quote(query)}")
+            return f"Searching YouTube for {query}, {SYS_CONFIG['user_title']}."
     except Exception:
-        return "Scroll failed, Sir."
+        webbrowser.open(f"https://www.youtube.com/results?search_query={quote(query)}")
+        return f"Opening YouTube for {query}, {SYS_CONFIG['user_title']}."
+
+def do_type_text(text):
+    try:
+        pyautogui.write(text, interval=0.02)
+        return f"Typed text, {SYS_CONFIG['user_title']}."
+    except Exception:
+        return f"Failed to type, {SYS_CONFIG['user_title']}."
+
+def do_hotkey(k1, k2):
+    try:
+        pyautogui.hotkey(k1, k2)
+        return f"Command executed, {SYS_CONFIG['user_title']}."
+    except Exception:
+        return f"Failed to execute command, {SYS_CONFIG['user_title']}."
+
+def do_adjust_volume(action):
+    try:
+        if action == "up":
+            for _ in range(5): pyautogui.press("volumeup")
+            return f"Volume increased, {SYS_CONFIG['user_title']}."
+        elif action == "down":
+            for _ in range(5): pyautogui.press("volumedown")
+            return f"Volume decreased, {SYS_CONFIG['user_title']}."
+        elif action == "mute":
+            pyautogui.press("volumemute")
+            return f"Audio muted, {SYS_CONFIG['user_title']}."
+    except Exception:
+        return f"Volume control failed, {SYS_CONFIG['user_title']}."
 
 def do_screenshot():
     try:
@@ -225,241 +282,130 @@ def do_screenshot():
         os.makedirs(shots_dir, exist_ok=True)
         filepath = os.path.join(shots_dir, f"screenshot_{int(time.time())}.png")
         pyautogui.screenshot(filepath)
-        return "Screenshot saved to your Jarvis folder, Sir."
+        return f"Screenshot saved, {SYS_CONFIG['user_title']}."
     except Exception:
-        return "Screenshot failed, Sir."
+        return f"Screenshot failed, {SYS_CONFIG['user_title']}."
 
-def do_adjust_volume(action):
-    try:
-        if action == "up":
-            for _ in range(5): pyautogui.press("volumeup")
-            return "Volume increased, Sir."
-        elif action == "down":
-            for _ in range(5): pyautogui.press("volumedown")
-            return "Volume decreased, Sir."
-        elif action == "mute":
-            pyautogui.press("volumemute")
-            return "Audio toggled, Sir."
-    except Exception:
-        return "Audio adjustment failed, Sir."
+def get_real_time():
+    now = datetime.datetime.now()
+    return f"The time is {now.strftime('%I:%M %p')}, {SYS_CONFIG['user_title']}."
 
-def do_shutdown():
-    os.system("shutdown /s /t 5")
-    return "Shutting down system in 5 seconds, Sir."
+def get_real_date():
+    now = datetime.datetime.now()
+    return f"Today is {now.strftime('%A, %B %d, %Y')}, {SYS_CONFIG['user_title']}."
 
-def do_restart():
-    os.system("shutdown /r /t 5")
-    return "Restarting system in 5 seconds, Sir."
-
-def do_lock_pc():
-    ctypes.windll.user32.LockWorkStation()
-    return "System locked, Sir."
-
-def get_battery():
-    battery = psutil.sensors_battery()
-    if battery:
-        plug = "plugged in" if battery.power_plugged else "on battery"
-        return f"Battery is at {battery.percent} percent and {plug}, Sir."
-    return "Battery details unavailable, Sir."
-
-def get_sys_stats():
+def get_sys_diagnostics():
     cpu = psutil.cpu_percent(interval=0.1)
     ram = psutil.virtual_memory().percent
-    return f"CPU is at {cpu} percent, RAM is at {ram} percent, Sir."
+    battery = psutil.sensors_battery()
+    bat_str = f"{battery.percent}%" if battery else "N/A"
+    return f"CPU at {cpu} percent, RAM at {ram} percent, Battery at {bat_str}, {SYS_CONFIG['user_title']}."
 
 # ──────────────────────────────────────────────
-# 🎯 SYSTEM INTENT & MEMORY PARSER
+# 🎯 INTENT ROUTER & DISPATCHER
 # ──────────────────────────────────────────────
-def parse_system_intent(raw_spoken_text):
-    global pending_action_func, pending_action_desc, pending_action_expiry
-    
-    cmd_raw = raw_spoken_text.lower().strip()
-    cmd_clean = clean_sentence(raw_spoken_text)
+def parse_and_execute_intent(raw_text):
+    cmd_raw = raw_text.lower().strip()
+    cmd_clean = sanitize_command(raw_text)
 
-    # 1. STEP 2: USER CONFIRMATION CHECK (Runs first)
-    if pending_action_func and time.time() < pending_action_expiry:
-        affirmative_words = ["yes", "yeah", "sure", "confirm", "do it", "proceed", "go ahead", "okay", "ok", "yep"]
-        negative_words = ["no", "nop", "cancel", "stop", "dont", "don't", "nevermind"]
+    # 1. Identity Mutation Commands
+    if "your name is now " in cmd_raw or "change your name to " in cmd_raw or "call yourself " in cmd_raw:
+        new_n = re.sub(r'.*(your name is now|change your name to|call yourself)\s+', '', cmd_raw).strip()
+        if new_n:
+            return do_change_identity(new_n)
 
-        if any(word in cmd_raw.split() for word in affirmative_words) or cmd_raw in affirmative_words:
-            func_to_run = pending_action_func
-            pending_action_func = None
-            pending_action_desc = ""
-            return func_to_run()
+    if "call me " in cmd_raw or "my title is " in cmd_raw:
+        new_t = re.sub(r'.*(call me|my title is)\s+', '', cmd_raw).strip()
+        if new_t:
+            return do_change_user_title(new_t)
 
-        elif any(word in cmd_raw.split() for word in negative_words) or cmd_raw in negative_words:
-            pending_action_func = None
-            pending_action_desc = ""
-            return "Action cancelled, Sir."
+    # 2. Long-Term Memory Commands
+    if "remember that " in cmd_raw or "remember " in cmd_clean:
+        fact = cmd_raw.replace("remember that ", "").replace("remember ", "").strip()
+        if fact:
+            save_memory(f"fact_{int(time.time())}", fact)
+            return f"I have saved that to memory, {SYS_CONFIG['user_title']}: '{fact}'"
 
-    # Clear expired confirmation
-    if pending_action_func and time.time() >= pending_action_expiry:
-        pending_action_func = None
-        pending_action_desc = ""
-
-    # 2. EXPLICIT MEMORY COMMANDS
-    if cmd_raw.startswith("remember that ") or cmd_clean.startswith("remember that "):
-        fact_to_save = cmd_raw.replace("remember that ", "").replace("remember ", "").strip()
-        if ":" in fact_to_save:
-            k, v = fact_to_save.split(":", 1)
-            save_memory(k.strip(), v.strip())
-        else:
-            save_memory(f"memory_{int(time.time())}", fact_to_save)
-        return f"I have committed that to memory, Sir: '{fact_to_save}'"
-
-    if "forget everything" in cmd_clean or "clear memory" in cmd_clean:
-        return register_pending_action(
-            clear_memories,
-            "delete all saved memories from disk"
-        )
-
-    if "what do you remember" in cmd_clean or "list memories" in cmd_clean:
+    if "what do you remember" in cmd_clean or "list memories" in cmd_clean or "my memories" in cmd_clean:
         mems = load_memories()
         if not mems:
-            return "I currently have no stored memories, Sir."
-        m_list = ", ".join([f"{v}" for v in mems.values()])
-        return f"Here is what I remember: {m_list}, Sir."
+            return f"I have no stored memories, {SYS_CONFIG['user_title']}."
+        return f"Here is what I remember: {', '.join(mems.values())}, {SYS_CONFIG['user_title']}."
 
-    # 3. REAL TIME & DATE
+    # 3. Real Time & Date
     if any(w in cmd_clean for w in ["time now", "what time", "current time", "what is the time"]):
         return get_real_time()
 
     if any(w in cmd_clean for w in ["today date", "what date", "current date", "what is the date", "today's date"]):
         return get_real_date()
 
-    # 4. APP LAUNCHING & PC CONTROL INTENTS
+    # 4. Multi-Step Camera Automation
+    if "take a photo" in cmd_raw or "take photo" in cmd_raw or "capture photo" in cmd_raw or ("camera" in cmd_raw and "photo" in cmd_raw):
+        return do_camera_snap()
+
+    # 5. YouTube Song Automation
+    if cmd_clean.startswith("play ") or "play " in cmd_raw:
+        song = re.sub(r'.*play\s+', '', cmd_raw).replace("on youtube", "").strip()
+        if song:
+            return do_play_youtube(song)
+
+    # 6. Process Termination / Killing
+    if cmd_clean.startswith("close ") or cmd_clean.startswith("kill ") or cmd_clean.startswith("stop "):
+        target_p = re.sub(r'^(close|kill|stop)\s+', '', cmd_clean).strip()
+        if "window" in target_p or "this" in target_p:
+            return do_hotkey('alt', 'f4')
+        elif target_p:
+            return do_kill_process(target_p)
+
+    # 7. Open Installed Application
     if cmd_clean.startswith("open ") or "open " in cmd_raw:
-        app_target = re.sub(r'.*open\s+', '', cmd_raw).strip()
-        if app_target:
-            return register_pending_action(
-                lambda: do_open_app(app_target),
-                f"open {app_target}"
-            )
+        target_a = re.sub(r'.*open\s+', '', cmd_raw).strip()
+        if target_a:
+            return do_open_app(target_a)
 
+    # 8. Keyboard & System Automation
     if cmd_clean.startswith("type ") or "type " in cmd_raw:
-        text_target = re.sub(r'.*type\s+', '', cmd_raw).strip()
-        if text_target:
-            return register_pending_action(
-                lambda: do_type_text(text_target),
-                f"type '{text_target}'"
-            )
-
-    if "close window" in cmd_clean or "close this" in cmd_clean:
-        return register_pending_action(
-            lambda: do_hotkey('alt', 'f4'),
-            "close the active window"
-        )
+        txt = re.sub(r'.*type\s+', '', cmd_raw).strip()
+        if txt:
+            return do_type_text(txt)
 
     if "show desktop" in cmd_clean or "minimize all" in cmd_clean:
-        return register_pending_action(
-            lambda: do_hotkey('win', 'd'),
-            "show the desktop"
-        )
+        return do_hotkey('win', 'd')
 
     if "switch window" in cmd_clean or "switch app" in cmd_clean:
-        return register_pending_action(
-            lambda: do_hotkey('alt', 'tab'),
-            "switch windows"
-        )
-
-    if "press enter" in cmd_clean:
-        return register_pending_action(
-            lambda: do_press_key('enter'),
-            "press Enter"
-        )
-
-    if "press space" in cmd_clean or "spacebar" in cmd_clean:
-        return register_pending_action(
-            lambda: do_press_key('space'),
-            "press Spacebar"
-        )
-
-    if "copy" in cmd_clean and len(cmd_clean) < 10:
-        return register_pending_action(
-            lambda: do_hotkey('ctrl', 'c'),
-            "copy selected items"
-        )
-
-    if "paste" in cmd_clean and len(cmd_clean) < 10:
-        return register_pending_action(
-            lambda: do_hotkey('ctrl', 'v'),
-            "paste from clipboard"
-        )
-
-    if "select all" in cmd_clean:
-        return register_pending_action(
-            lambda: do_hotkey('ctrl', 'a'),
-            "select all items"
-        )
-
-    if "scroll down" in cmd_clean:
-        return register_pending_action(
-            lambda: do_scroll("down"),
-            "scroll down"
-        )
-
-    if "scroll up" in cmd_clean:
-        return register_pending_action(
-            lambda: do_scroll("up"),
-            "scroll up"
-        )
+        return do_hotkey('alt', 'tab')
 
     if "screenshot" in cmd_clean or "capture screen" in cmd_clean:
-        return register_pending_action(
-            do_screenshot,
-            "take a screenshot"
-        )
+        return do_screenshot()
 
     if "volume up" in cmd_clean or "increase volume" in cmd_clean:
-        return register_pending_action(
-            lambda: do_adjust_volume("up"),
-            "increase volume"
-        )
+        return do_adjust_volume("up")
 
     if "volume down" in cmd_clean or "decrease volume" in cmd_clean:
-        return register_pending_action(
-            lambda: do_adjust_volume("down"),
-            "decrease volume"
-        )
+        return do_adjust_volume("down")
 
     if "mute" in cmd_clean or "unmute" in cmd_clean:
-        return register_pending_action(
-            lambda: do_adjust_volume("mute"),
-            "toggle audio mute"
-        )
+        return do_adjust_volume("mute")
 
-    if "lock pc" in cmd_clean or "lock laptop" in cmd_clean or "lock screen" in cmd_clean:
-        return register_pending_action(
-            do_lock_pc,
-            "lock the system"
-        )
+    if "lock pc" in cmd_clean or "lock laptop" in cmd_clean:
+        ctypes.windll.user32.LockWorkStation()
+        return f"System locked, {SYS_CONFIG['user_title']}."
 
     if "shutdown" in cmd_clean or "shut down" in cmd_clean:
-        return register_pending_action(
-            do_shutdown,
-            "shut down the computer"
-        )
+        os.system("shutdown /s /t 5")
+        return f"Shutting down in 5 seconds, {SYS_CONFIG['user_title']}."
 
-    if "restart" in cmd_clean or "reboot" in cmd_clean:
-        return register_pending_action(
-            do_restart,
-            "restart the computer"
-        )
-
-    if "battery" in cmd_clean:
-        return get_battery()
-
-    if "system status" in cmd_clean or "cpu" in cmd_clean or "ram" in cmd_clean or "performance" in cmd_clean:
-        return get_sys_stats()
+    if "system status" in cmd_clean or "diagnostics" in cmd_clean or "battery" in cmd_clean:
+        return get_sys_diagnostics()
 
     return None
 
 # ──────────────────────────────────────────────
 # BOOT SEQUENCE
 # ──────────────────────────────────────────────
-print("=" * 60)
-print("  🤖 JARVIS (UNIVERSAL CONTROL & PERSISTENT MEMORY)")
-print("=" * 60)
+print("=" * 65)
+print("  🤖 INDUSTRIAL JARVIS ENGINE (DYNAMIC IDENTITY & FULL OS CONTROL)")
+print("=" * 65)
 
 print(f"\n[1/2] Connecting to Local GPU Brain ({LOCAL_MODEL})...")
 try:
@@ -468,27 +414,22 @@ try:
         messages=[{"role": "user", "content": "hi"}],
         options={"num_predict": 2}
     )
-    print(f"  ⚡ Local GPU Brain {LOCAL_MODEL} Ready!")
+    print(f"  ⚡ Local GPU Brain {LOCAL_MODEL} Online!")
 except Exception:
-    print(f"  ⚠️ Could not find '{LOCAL_MODEL}'. Fallback to 'qwen2.5:3b'...")
+    print(f"  ⚠️ Could not find '{LOCAL_MODEL}'. Using 'qwen2.5:3b'...")
     LOCAL_MODEL = "qwen2.5:3b"
 
-print("[2/2] Loading Persistent Memory Engine & Safety Shield...")
-try:
-    mems = load_memories()
-    print(f"  ✅ Memory File Loaded ({len(mems)} stored facts).")
-except Exception as e:
-    print(f"  ⚠️ Memory init error: {e}")
+print("[2/2] Loading System Registry & Configuration State...")
+print(f"  ✅ Assistant Name: {SYS_CONFIG['assistant_name']}")
+print(f"  ✅ User Title:     {SYS_CONFIG['user_title']}")
 
-print("\n" + "=" * 60)
-print("  🗣️  JARVIS FULL PC CONTROL & MEMORY ONLINE")
-print("  Try: 'open photoshop', 'remember that my project is AI', 'what time is it'")
-print("=" * 60 + "\n")
-
-chat_history = [{"role": "system", "content": build_dynamic_system_prompt()}]
+print("\n" + "=" * 65)
+print(f"  🗣️  SYSTEM ONLINE! ({SYS_CONFIG['assistant_name']} Active)")
+print("  Commands: 'open photoshop', 'your name is now Binusha', 'play believers on youtube'")
+print("=" * 65 + "\n")
 
 # ──────────────────────────────────────────────
-# INSTANT VOICE ACTIVITY DETECTOR
+# AUDIO & AI PIPELINE
 # ──────────────────────────────────────────────
 def listen_smart_vad():
     recorded_chunks = []
@@ -531,13 +472,20 @@ def listen_smart_vad():
 
 def check_wake_word(text):
     lower_text = text.lower().strip()
-    for w in WAKE_WORDS:
+    for w in SYS_CONFIG["wake_words"]:
         if w in lower_text:
             return w
     return None
 
+chat_history = []
+
 def ask_ai(user_message):
-    chat_history[0] = {"role": "system", "content": build_dynamic_system_prompt()}
+    sys_prompt = build_system_prompt()
+    if not chat_history:
+        chat_history.append({"role": "system", "content": sys_prompt})
+    else:
+        chat_history[0] = {"role": "system", "content": sys_prompt}
+
     chat_history.append({"role": "user", "content": user_message})
     
     if len(chat_history) > 7:
@@ -548,7 +496,7 @@ def ask_ai(user_message):
             model=LOCAL_MODEL,
             messages=chat_history,
             options={
-                "num_predict": 30,
+                "num_predict": 35,
                 "temperature": 0.4,
                 "num_ctx": 1024
             }
@@ -556,14 +504,15 @@ def ask_ai(user_message):
         reply = response['message']['content'].strip()
         reply = re.sub(r'[*#_~`>-]', '', reply).strip()
         chat_history.append({"role": "assistant", "content": reply})
-        return reply if reply else "Pardon me Sir, please repeat."
+        return reply if reply else f"Pardon me {SYS_CONFIG['user_title']}, please repeat."
 
     except Exception as e:
-        print(f"\n  ⚠️ Ollama Error: {e}")
-        return "Pardon me Sir, an error occurred."
+        print(f"\n  ⚠️ AI Error: {e}")
+        return f"Pardon me {SYS_CONFIG['user_title']}, an error occurred."
 
 async def _generate_speech(text):
-    communicate = edge_tts.Communicate(text=text, voice="en-GB-RyanNeural", rate="+10%")
+    rate_str = SYS_CONFIG.get("voice_rate", "+10%")
+    communicate = edge_tts.Communicate(text=text, voice="en-GB-RyanNeural", rate=rate_str)
     audio_buffer = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -586,7 +535,7 @@ def speak(text):
         print(f"\n⚠️ Voice Output Error: {e}")
 
 # ──────────────────────────────────────────────
-# MAIN LOOP
+# MAIN RUN LOOP
 # ──────────────────────────────────────────────
 def main():
     is_active = False
@@ -594,15 +543,17 @@ def main():
 
     while True:
         try:
+            current_name = SYS_CONFIG["assistant_name"]
+            
             if is_active:
                 remaining = int(CONVERSATION_TIMEOUT - (time.time() - last_interaction))
                 if remaining > 0:
-                    print(f"\n🟢 [ACTIVE - {remaining}s left] 🎤 Listening...")
+                    print(f"\n🟢 [ACTIVE - {remaining}s left] 🎤 Listening...", end="", flush=True)
                 else:
                     is_active = False
-                    print("\n⚪ [STANDBY] 🎤 Listening for 'Jarvis'...")
+                    print(f"\n⚪ [STANDBY] 🎤 Listening for '{current_name}'...", end="", flush=True)
             else:
-                print("\n⚪ [STANDBY] 🎤 Listening for 'Jarvis'...")
+                print(f"\n⚪ [STANDBY] 🎤 Listening for '{current_name}'...", end="", flush=True)
 
             spoken_text = listen_smart_vad()
 
@@ -612,7 +563,7 @@ def main():
             if not spoken_text or len(spoken_text) < 2:
                 continue
 
-            print(f"👂 Heard: \"{spoken_text}\"")
+            print(f"\r👂 Heard: \"{spoken_text}\"")
 
             matched_wake = check_wake_word(spoken_text)
             command = None
@@ -622,37 +573,36 @@ def main():
                 last_interaction = time.time()
                 command = re.sub(re.escape(matched_wake), '', spoken_text, flags=re.IGNORECASE).strip(" ,.?!:;")
                 if not command or len(command) < 2:
-                    command = "Hello Jarvis"
+                    command = f"Hello {current_name}"
             elif is_active:
                 last_interaction = time.time()
                 command = spoken_text
 
             if command:
                 print(f"👤 You: {command}")
-                
                 start_t = time.time()
                 
-                # 1. System Intent & Memory Check
-                system_reply = parse_system_intent(command)
+                # 1. System Intent & Dynamic OS Automation (0.01s Execution)
+                system_reply = parse_and_execute_intent(command)
                 
                 if system_reply:
                     answer = system_reply
                     elapsed = time.time() - start_t
-                    print(f"⚙️ System/Memory Action ({elapsed:.2f}s)")
+                    print(f"⚙️ Direct Execution ({elapsed:.2f}s)")
                 else:
-                    # 2. Conversational Questions -> LLM AI (with Memory context)
+                    # 2. ChatGPT-Level Intelligence Questions -> Local GPU Model
                     print("🧠 Thinking...", end="", flush=True)
                     answer = ask_ai(command)
                     elapsed = time.time() - start_t
                     print(f" ({elapsed:.2f}s)")
 
-                print(f"🤖 JARVIS: {answer}")
+                print(f"🤖 {SYS_CONFIG['assistant_name']}: {answer}")
                 
                 speak(answer)
                 last_interaction = time.time()
 
         except KeyboardInterrupt:
-            print("\nShutting down JARVIS. Goodbye Sir!")
+            print(f"\nShutting down {SYS_CONFIG['assistant_name']}. Goodbye {SYS_CONFIG['user_title']}!")
             break
         except Exception as e:
             print(f"\n⚠️ Loop error: {e}")
