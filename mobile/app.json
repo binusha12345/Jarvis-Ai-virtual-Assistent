@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "JARVIS AI",
+    "slug": "jarvis-mobile-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "android": {
+      "package": "com.binusha.jarvisapp",
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0E27"
+      }
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-font"
+    ]
+  }
+}
