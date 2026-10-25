@@ -1,590 +1,234 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import os
 import sys
 import re
-import io
 import time
-import json
 import datetime
-import asyncio
-import subprocess
-import webbrowser
-import ctypes
-from urllib.parse import quote
-import numpy as np
-import sounddevice as sd
-import speech_recognition as sr
-import edge_tts
 import ollama
-import pygame
-import psutil
-import pyautogui
-import pyperclip
-
-# --- MODERN WEB SEARCH ENGINE IMPORT ---
-try:
-    from ddgs import DDGS
-    HAS_DDG = True
-except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-        HAS_DDG = True
-    except ImportError:
-        HAS_DDG = False
-
-try:
-    import pywhatkit
-    HAS_PYWHATKIT = True
-except ImportError:
-    HAS_PYWHATKIT = False
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-BASE_DIR = r"D:\JARVIS"
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
-HISTORY_FILE = os.path.join(BASE_DIR, "chat_history.json")
-
-LOCAL_MODEL = "qwen2.5:1.5b"
-SAMPLE_RATE = 16000
-CONVERSATION_TIMEOUT = 18
-
-CHUNK_SIZE = 1600
-ENERGY_THRESHOLD = 300
-SILENCE_CHUNKS_LIMIT = 12
-
-DEFAULT_CONFIG = {
-    "assistant_name": "JARVIS",
-    "user_title": "Sir",
-    "wake_words": ["jarvis", "jarvice", "javis", "javi", "travis", "hello", "hi", "binusha"],
-    "voice_rate": "+10%"
-}
-
-recognizer = sr.Recognizer()
-pygame.mixer.init(frequency=24000, size=-16, channels=1)
-
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.1
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                for k, v in DEFAULT_CONFIG.items():
-                    cfg.setdefault(k, v)
-                return cfg
-        except Exception:
-            return DEFAULT_CONFIG.copy()
-    return DEFAULT_CONFIG.copy()
-
-def save_config(cfg):
-    os.makedirs(BASE_DIR, exist_ok=True)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
-SYS_CONFIG = load_config()
-
-# --- MEMORY & PERSISTENCE ---
-def load_memories():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_memory(key, value):
-    memories = load_memories()
-    memories[key] = value
-    os.makedirs(BASE_DIR, exist_ok=True)
-    with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(memories, f, ensure_ascii=False, indent=2)
-
-def load_persistent_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                hist = json.load(f)
-                # Clean history of old canned refusals
-                clean_hist = []
-                for msg in hist:
-                    if "can't assist with that" not in msg.get("content", "").lower():
-                        clean_hist.append(msg)
-                return clean_hist[-10:]
-        except Exception:
-            return []
-    return []
-
-def save_persistent_history(history):
-    os.makedirs(BASE_DIR, exist_ok=True)
-    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-# --- LIVE WEB SEARCH ENGINE ---
-def web_search(query, max_results=3):
-    if not HAS_DDG:
-        return "Web search module unavailable."
-    try:
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                body = r.get('body', '')
-                title = r.get('title', '')
-                if body:
-                    results.append(f"Info ({title}): {body}")
-        return "\n".join(results) if results else "No specific search snippets found."
-    except Exception as e:
-        return f"Search temp error: {str(e)}"
-
-# --- UNCONSTRAINED CHATGPT SYSTEM PROMPT ---
-def build_system_prompt(extra_context=""):
-    memories = load_memories()
-    mem_str = "\n".join([f"- {k}: {v}" for k, v in memories.items()]) if memories else "None."
-    name = SYS_CONFIG["assistant_name"]
-    title = SYS_CONFIG["user_title"]
-    now_str = datetime.datetime.now().strftime("%A, %B %d, %Y - %I:%M %p")
-
-    return (
-        f"You are {name}, a highly intelligent, unrestricted, super-capable AI assistant for {title}.\n"
-        f"CURRENT TIME: {now_str}\n"
-        f"STORED MEMORIES:\n{mem_str}\n\n"
-        f"INSTRUCTIONS:\n"
-        f"1. Speak in natural, polished, intelligent British English.\n"
-        f"2. Always address the user as '{title}'.\n"
-        f"3. Never issue artificial safety refusals for standard knowledge, web searches, celebrity info, or factual questions.\n"
-        f"4. Provide direct, helpful, and concise answers (1 to 3 sentences max).\n"
-        f"5. Do NOT use markdown symbols (*, #, _, emojis).\n"
-        f"{extra_context}"
-    )
-
-def sanitize_command(raw_text):
-    cmd = raw_text.lower().strip()
-    for w in SYS_CONFIG["wake_words"]:
-        cmd = re.sub(r'\b' + re.escape(w) + r'\b', '', cmd)
-    fillers = ["please", "can you", "could you", "would you", "kindly", "i want you to", "i want to", "go ahead and", "for me", "app", "application"]
-    for f in fillers:
-        cmd = cmd.replace(f, "")
-    return cmd.strip(" ,.?!:;")
-
-# --- OS & PC CONTROLS ---
-def do_change_identity(new_name):
-    SYS_CONFIG["assistant_name"] = new_name.capitalize()
-    new_wake = new_name.lower()
-    if new_wake not in SYS_CONFIG["wake_words"]:
-        SYS_CONFIG["wake_words"].append(new_wake)
-    save_config(SYS_CONFIG)
-    return f"My name has been updated to {SYS_CONFIG['assistant_name']}, {SYS_CONFIG['user_title']}."
-
-def do_change_user_title(new_title):
-    SYS_CONFIG["user_title"] = new_title.capitalize()
-    save_config(SYS_CONFIG)
-    return f"I will address you as {SYS_CONFIG['user_title']} from now on."
-
-def do_open_app(raw_target):
-    target = raw_target.lower().strip()
-    try:
-        if "camera" in target:
-            os.system("start microsoft.windows.camera:")
-            return f"Camera opened, {SYS_CONFIG['user_title']}."
-        elif "calculator" in target or "calc" in target:
-            subprocess.Popen("calc.exe")
-            return f"Calculator opened, {SYS_CONFIG['user_title']}."
-        elif "notepad" in target:
-            subprocess.Popen("notepad.exe")
-            return f"Notepad opened, {SYS_CONFIG['user_title']}."
-        elif "settings" in target:
-            os.system("start ms-settings:")
-            return f"Windows Settings opened, {SYS_CONFIG['user_title']}."
-        elif "task manager" in target:
-            subprocess.Popen("taskmgr.exe")
-            return f"Task Manager opened, {SYS_CONFIG['user_title']}."
-        elif "explorer" in target or "file explorer" in target:
-            subprocess.Popen("explorer.exe")
-            return f"File Explorer opened, {SYS_CONFIG['user_title']}."
-        elif "youtube" in target:
-            webbrowser.open("https://www.youtube.com")
-            return f"YouTube opened, {SYS_CONFIG['user_title']}."
-        elif "chrome" in target or "browser" in target:
-            webbrowser.open("https://www.google.com")
-            return f"Browser opened, {SYS_CONFIG['user_title']}."
-        else:
-            pyautogui.press('win')
-            time.sleep(0.3)
-            pyautogui.write(target, interval=0.03)
-            time.sleep(0.4)
-            pyautogui.press('enter')
-            return f"Launching {raw_target}, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Failed to launch {raw_target}, {SYS_CONFIG['user_title']}."
-
-def do_kill_process(proc_name):
-    killed = False
-    clean_p = proc_name.lower().strip()
-    for proc in psutil.process_iter(['name']):
-        try:
-            if clean_p in proc.info['name'].lower():
-                proc.kill()
-                killed = True
-        except Exception:
-            pass
-    if killed:
-        return f"Terminated process {proc_name}, {SYS_CONFIG['user_title']}."
-    return f"Could not find running process {proc_name}, {SYS_CONFIG['user_title']}."
-
-def do_camera_snap():
-    try:
-        os.system("start microsoft.windows.camera:")
-        time.sleep(2.5)
-        pyautogui.press('space')
-        return f"Camera launched and photo captured, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Camera capture failed, {SYS_CONFIG['user_title']}."
-
-def do_play_youtube(query):
-    try:
-        if HAS_PYWHATKIT:
-            pywhatkit.playonyt(query)
-            return f"Playing {query} on YouTube, {SYS_CONFIG['user_title']}."
-        else:
-            webbrowser.open(f"https://www.youtube.com/results?search_query={quote(query)}")
-            return f"Searching YouTube for {query}, {SYS_CONFIG['user_title']}."
-    except Exception:
-        webbrowser.open(f"https://www.youtube.com/results?search_query={quote(query)}")
-        return f"Opening YouTube for {query}, {SYS_CONFIG['user_title']}."
-
-def do_type_text(text):
-    try:
-        pyautogui.write(text, interval=0.02)
-        return f"Typed text, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Failed to type, {SYS_CONFIG['user_title']}."
-
-def do_create_note(content):
-    try:
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-        filepath = os.path.join(desktop, f"JARVIS_Note_{int(time.time())}.txt")
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        return f"Saved note to your Desktop, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Failed to save note on Desktop, {SYS_CONFIG['user_title']}."
-
-def do_read_clipboard():
-    try:
-        text = pyperclip.paste()
-        if not text:
-            return f"Your clipboard is currently empty, {SYS_CONFIG['user_title']}."
-        return f"Clipboard contents: '{text[:200]}'"
-    except Exception:
-        return f"Could not read clipboard, {SYS_CONFIG['user_title']}."
-
-def do_hotkey(k1, k2):
-    try:
-        pyautogui.hotkey(k1, k2)
-        return f"Command executed, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Failed to execute command, {SYS_CONFIG['user_title']}."
-
-def do_adjust_volume(action):
-    try:
-        if action == "up":
-            for _ in range(5): pyautogui.press("volumeup")
-            return f"Volume increased, {SYS_CONFIG['user_title']}."
-        elif action == "down":
-            for _ in range(5): pyautogui.press("volumedown")
-            return f"Volume decreased, {SYS_CONFIG['user_title']}."
-        elif action == "mute":
-            pyautogui.press("volumemute")
-            return f"Audio muted, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Volume control failed, {SYS_CONFIG['user_title']}."
-
-def do_screenshot():
-    try:
-        shots_dir = os.path.join(BASE_DIR, "Screenshots")
-        os.makedirs(shots_dir, exist_ok=True)
-        filepath = os.path.join(shots_dir, f"screenshot_{int(time.time())}.png")
-        pyautogui.screenshot(filepath)
-        return f"Screenshot saved, {SYS_CONFIG['user_title']}."
-    except Exception:
-        return f"Screenshot failed, {SYS_CONFIG['user_title']}."
-
-def get_real_time():
-    now = datetime.datetime.now()
-    return f"The time is {now.strftime('%I:%M %p')}, {SYS_CONFIG['user_title']}."
-
-def get_real_date():
-    now = datetime.datetime.now()
-    return f"Today is {now.strftime('%A, %B %d, %Y')}, {SYS_CONFIG['user_title']}."
-
-def get_sys_diagnostics():
-    cpu = psutil.cpu_percent(interval=0.1)
-    ram = psutil.virtual_memory().percent
-    battery = psutil.sensors_battery()
-    bat_str = f"{battery.percent}%" if battery else "N/A"
-    return f"CPU utilization is at {cpu} percent, RAM at {ram} percent, Battery at {bat_str}, {SYS_CONFIG['user_title']}."
-
-# --- INTENT PARSER ---
-def parse_and_execute_intent(raw_text):
-    cmd_raw = raw_text.lower().strip()
-    cmd_clean = sanitize_command(raw_text)
-
-    if "your name is now " in cmd_raw or "change your name to " in cmd_raw or "call yourself " in cmd_raw:
-        new_n = re.sub(r'.*(your name is now|change your name to|call yourself)\s+', '', cmd_raw).strip()
-        if new_n: return do_change_identity(new_n)
-
-    if "call me " in cmd_raw or "my title is " in cmd_raw:
-        new_t = re.sub(r'.*(call me|my title is)\s+', '', cmd_raw).strip()
-        if new_t: return do_change_user_title(new_t)
-
-    if "remember that " in cmd_raw or "remember " in cmd_clean:
-        fact = cmd_raw.replace("remember that ", "").replace("remember ", "").strip()
-        if fact:
-            save_memory(f"fact_{int(time.time())}", fact)
-            return f"I have committed that to memory, {SYS_CONFIG['user_title']}: '{fact}'"
-
-    if "what do you remember" in cmd_clean or "list memories" in cmd_clean or "my memories" in cmd_clean:
-        mems = load_memories()
-        if not mems: return f"I have no stored long-term memories yet, {SYS_CONFIG['user_title']}."
-        return f"Here is what I remember: {', '.join(mems.values())}, {SYS_CONFIG['user_title']}."
-
-    if any(w in cmd_clean for w in ["time now", "what time", "current time", "what is the time"]): return get_real_time()
-    if any(w in cmd_clean for w in ["today date", "what date", "current date", "what is the date", "today's date"]): return get_real_date()
-
-    if "take a photo" in cmd_raw or "take photo" in cmd_raw or "capture photo" in cmd_raw or ("camera" in cmd_raw and "photo" in cmd_raw):
-        return do_camera_snap()
-
-    if cmd_clean.startswith("play ") or "play " in cmd_raw:
-        song = re.sub(r'.*play\s+', '', cmd_raw).replace("on youtube", "").strip()
-        if song: return do_play_youtube(song)
-
-    if "read clipboard" in cmd_clean or "what is in my clipboard" in cmd_clean:
-        return do_read_clipboard()
-
-    if "create note" in cmd_clean or "take note" in cmd_clean or "save note" in cmd_clean:
-        note_text = re.sub(r'.*(create note|take note|save note)\s*', '', cmd_raw).strip()
-        if note_text: return do_create_note(note_text)
-
-    if cmd_clean.startswith("close ") or cmd_clean.startswith("kill ") or cmd_clean.startswith("stop "):
-        target_p = re.sub(r'^(close|kill|stop)\s+', '', cmd_clean).strip()
-        if "window" in target_p or "this" in target_p: return do_hotkey('alt', 'f4')
-        elif target_p: return do_kill_process(target_p)
-
-    if cmd_clean.startswith("open ") or "open " in cmd_raw:
-        target_a = re.sub(r'.*open\s+', '', cmd_raw).strip()
-        if target_a: return do_open_app(target_a)
-
-    if cmd_clean.startswith("type ") or "type " in cmd_raw:
-        txt = re.sub(r'.*type\s+', '', cmd_raw).strip()
-        if txt: return do_type_text(txt)
-
-    if "show desktop" in cmd_clean or "minimize all" in cmd_clean: return do_hotkey('win', 'd')
-    if "switch window" in cmd_clean or "switch app" in cmd_clean: return do_hotkey('alt', 'tab')
-    if "screenshot" in cmd_clean or "capture screen" in cmd_clean: return do_screenshot()
-    if "volume up" in cmd_clean or "increase volume" in cmd_clean: return do_adjust_volume("up")
-    if "volume down" in cmd_clean or "decrease volume" in cmd_clean: return do_adjust_volume("down")
-    if "mute" in cmd_clean or "unmute" in cmd_clean: return do_adjust_volume("mute")
-    if "lock pc" in cmd_clean or "lock laptop" in cmd_clean:
-        ctypes.windll.user32.LockWorkStation()
-        return f"System locked, {SYS_CONFIG['user_title']}."
-    if "shutdown" in cmd_clean or "shut down" in cmd_clean:
-        os.system("shutdown /s /t 5")
-        return f"Shutting down in 5 seconds, {SYS_CONFIG['user_title']}."
-    if "system status" in cmd_clean or "diagnostics" in cmd_clean or "battery" in cmd_clean: return get_sys_diagnostics()
-
-    return None
+from core.config import SYS_CONFIG, LOCAL_MODEL, CONVERSATION_TIMEOUT
+from core.brain import ask_ai
+from core.router import sanitize_command, classify_intent
+from core.memory import save_memory, load_memories
+from engines.vad_engine import listen_smart_vad
+from engines.stt_engine import transcribe
+from engines.tts_engine import speak, play_fx
+from engines.vision_engine import see_screen, see_camera
+from modules.web_search import web_search
+from modules.clipboard_ai import transform_clipboard
+from modules.file_manager import organize_folder, find_large_files
+from modules.scheduler import add_reminder, start_scheduler
+from modules import os_control
+from ui.hud_overlay import start_hud, set_hud
 
 print("=" * 65)
-print("  🤖 INDUSTRIAL CHATGPT-GRADE JARVIS BRAIN ENGINE")
+print("  🤖 JARVIS INDUSTRIAL ENGINE v2.4 (PRECISION SCREEN & STT ENGINE)")
 print("=" * 65)
 
-print(f"\n[1/2] Connecting to Local GPU Brain ({LOCAL_MODEL})...")
+print(f"[1/3] Locking GPU Brain ({LOCAL_MODEL}) into VRAM...")
 try:
-    ollama.chat(model=LOCAL_MODEL, messages=[{"role": "user", "content": "hi"}], options={"num_predict": 2})
-    print(f"  ⚡ Local GPU Brain {LOCAL_MODEL} Online!")
+    ollama.chat(
+        model=LOCAL_MODEL, 
+        messages=[{"role": "user", "content": "hi"}], 
+        options={"num_predict": 2, "num_gpu": 99, "keep_alive": "60m"}
+    )
+    print("  ⚡ Local GPU Brain Online & VRAM Locked!")
 except Exception:
-    LOCAL_MODEL = "qwen2.5:3b"
+    print("  ⚠️ LLM Connection Offline")
 
-print("[2/2] Loading Registry, Long-Term Memory & Web Engine...")
-print(f"  ✅ Assistant Name: {SYS_CONFIG['assistant_name']}")
-print(f"  ✅ User Title:     {SYS_CONFIG['user_title']}")
-print(f"  ✅ Live Web Search:{' Enabled (DDGS)' if HAS_DDG else ' Disabled'}")
+print("[2/3] Starting Background Scheduler & Sci-Fi HUD...")
+start_scheduler()
+start_hud()
+time.sleep(0.3)
 
-print("\n" + "=" * 65)
-print(f"  🗣️  SYSTEM ONLINE! ({SYS_CONFIG['assistant_name']} Active)")
+print("[3/3] System Fully Active & Ready")
 print("=" * 65 + "\n")
 
-def listen_smart_vad():
-    recorded_chunks = []
-    has_started_speaking = False
-    silence_chunks = 0
-    max_duration_chunks = 120
-
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16', blocksize=CHUNK_SIZE) as stream:
-        for _ in range(max_duration_chunks):
-            chunk, _ = stream.read(CHUNK_SIZE)
-            audio_array = chunk.flatten()
-            rms = np.sqrt(np.mean(np.square(audio_array, dtype=np.float32))) if len(audio_array) > 0 else 0
-
-            if rms > ENERGY_THRESHOLD:
-                has_started_speaking = True
-                silence_chunks = 0
-                recorded_chunks.append(chunk)
-            elif has_started_speaking:
-                recorded_chunks.append(chunk)
-                silence_chunks += 1
-                if silence_chunks >= SILENCE_CHUNKS_LIMIT: break
-            else:
-                recorded_chunks.append(chunk)
-                if len(recorded_chunks) > 4: recorded_chunks.pop(0)
-
-    if not has_started_speaking or len(recorded_chunks) < 5: return ""
-
-    try:
-        full_audio = np.concatenate(recorded_chunks, axis=0)
-        raw_pcm = full_audio.tobytes()
-        sr_audio = sr.AudioData(raw_pcm, SAMPLE_RATE, 2)
-        return recognizer.recognize_google(sr_audio, language="en-US").strip()
-    except Exception:
-        return ""
-
-def check_wake_word(text):
-    lower_text = text.lower().strip()
+def check_wake(text):
+    lt = text.lower()
     for w in SYS_CONFIG["wake_words"]:
-        if w in lower_text: return w
+        if w in lt: return w
     return None
 
-chat_history = load_persistent_history()
+def execute_direct(text):
+    cmd = sanitize_command(text)
+    # 1. Clean STT speech homophone artifacts
+    raw = text.lower().strip()
+    raw = re.sub(r'\bts\b|\btis\b|\bdis\b', 'this', raw)
 
-def ask_ai(user_message):
-    global chat_history
-    extra_context = ""
-    
-    # Trigger web search on information requests
-    search_triggers = ["search", "who is", "what is", "latest news", "weather in", "price of", "tell me about", "website to", "find"]
-    if any(st in user_message.lower() for st in search_triggers) and HAS_DDG:
-        print(" 🌐 Live Searching Web...", end="", flush=True)
-        search_query = user_message.replace("search for", "").replace("search", "").strip()
-        search_data = web_search(search_query if search_query else user_message, max_results=3)
-        extra_context = f"\nREAL-TIME SEARCH CONTEXT:\n{search_data}\nSummarize this factual info clearly for the user."
+    # 2. PRIORITY 1: Explicit Structural Navigation Commands
+    if any(w in raw for w in ["first link", "first result", "open first link", "click first link", "go to first link"]):
+        return os_control.navigate_browser("click_first_link")
 
-    sys_prompt = build_system_prompt(extra_context)
+    if any(w in raw for w in ["go back", "previous page", "back page"]):
+        return os_control.navigate_browser("back")
 
-    messages = [{"role": "system", "content": sys_prompt}] + chat_history
-    messages.append({"role": "user", "content": user_message})
+    if any(w in raw for w in ["go forward", "next page"]):
+        return os_control.navigate_browser("forward")
 
-    try:
-        response = ollama.chat(
-            model=LOCAL_MODEL,
-            messages=messages,
-            options={"num_predict": 120, "temperature": 0.6, "num_ctx": 2048}
-        )
-        reply = response['message']['content'].strip()
-        reply = re.sub(r'[*#_~`>-]', '', reply).strip()
+    if any(w in raw for w in ["scroll down", "page down", "go down"]):
+        return os_control.navigate_browser("scroll_down")
 
-        # Prevent storing canned refusal loops into permanent chat context
-        if "can't assist with that" not in reply.lower():
-            chat_history.append({"role": "user", "content": user_message})
-            chat_history.append({"role": "assistant", "content": reply})
-            if len(chat_history) > 16:
-                chat_history = chat_history[-16:]
-            save_persistent_history(chat_history)
-        else:
-            reply = f"I am unable to find relevant information on that topic, {SYS_CONFIG['user_title']}."
+    if any(w in raw for w in ["scroll up", "page up", "go up"]):
+        return os_control.navigate_browser("scroll_up")
 
-        return reply if reply else f"Pardon me {SYS_CONFIG['user_title']}, please repeat."
-    except Exception:
-        return f"Pardon me {SYS_CONFIG['user_title']}, my local brain encountered an issue."
+    if any(w in raw for w in ["close tab", "close this tab"]):
+        return os_control.navigate_browser("close_tab")
 
-async def _generate_speech(text):
-    rate_str = SYS_CONFIG.get("voice_rate", "+10%")
-    communicate = edge_tts.Communicate(text=text, voice="en-GB-RyanNeural", rate=rate_str)
-    audio_buffer = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio": audio_buffer.write(chunk["data"])
-    audio_buffer.seek(0)
-    return audio_buffer
+    if any(w in raw for w in ["new tab", "open new tab"]):
+        return os_control.navigate_browser("new_tab")
 
-def speak(text):
-    try:
-        audio_stream = asyncio.run(_generate_speech(text))
-        pygame.mixer.music.load(audio_stream)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy(): pygame.time.wait(20)
-        pygame.mixer.music.unload()
-        time.sleep(0.15)
-    except Exception as e:
-        err = str(e)
-        if "403" in err:
-            print(" ⚠️ Voice Output Error: Edge TTS 403 (sync system time or upgrade edge-tts)")
-        else:
-            print(f" ⚠️ TTS Error: {err}")
+    if any(w in raw for w in ["refresh page", "reload page"]):
+        return os_control.navigate_browser("refresh")
+
+    # 3. PRIORITY 2: Specific Text & Tab Clicker Agent
+    click_match = re.search(r'(?:go to|click|open|select|press)(?:\s+the|\s+this|\s+page|\s+screen|\s+that)*\s+(.+)', raw)
+    if click_match and not any(w in raw for w in ["browser", "chrome", "youtube", "camera", "notepad", "settings", "calculator", "file", "folder", "desktop"]):
+        phrase = click_match.group(1).strip()
+        result = os_control.click_screen_element(phrase)
+        if result:
+            return result
+
+    # 4. PRIORITY 3: Compound Browser Search Commands
+    if ("open chrome" in raw or "open browser" in raw or "google" in raw) and "search" in raw:
+        query = re.sub(r'.*search\s+', '', raw).replace("on chrome", "").replace("on google", "").replace("in browser", "").strip()
+        return os_control.open_and_search(query)
+
+    if raw.startswith("search ") or "search for " in raw:
+        query = raw.replace("search for ", "").replace("search ", "").strip()
+        return os_control.open_and_search(query)
+
+    # 5. PRIORITY 4: Application Launcher
+    if cmd.startswith("open "):
+        return os_control.open_app(cmd.replace("open ", ""))
+    if cmd.startswith("close ") or cmd.startswith("kill "):
+        return os_control.kill_process(cmd.split(" ", 1)[1])
+
+    # 6. PRIORITY 5: YouTube Control
+    if cmd.startswith("play "):
+        song = cmd.replace("play ", "").replace("on youtube", "").strip()
+        return os_control.play_youtube(song)
+
+    # 7. PRIORITY 6: Memory System
+    if "remember " in raw:
+        fact = raw.replace("remember that ", "").replace("remember ", "").strip()
+        if fact:
+            save_memory(f"fact_{int(time.time())}", fact)
+            return f"Committed to memory, {SYS_CONFIG['user_title']}."
+
+    if "what do you remember" in cmd or "my memories" in cmd:
+        m = load_memories()
+        return f"I remember: {', '.join(m.values())}" if m else "No memories stored."
+
+    # 8. PRIORITY 7: Real-Time Information & System Hardware
+    if "time" in cmd and ("what" in cmd or "now" in cmd):
+        return f"The time is {datetime.datetime.now().strftime('%I:%M %p')}, {SYS_CONFIG['user_title']}."
+    if "date" in cmd and ("what" in cmd or "today" in cmd):
+        return f"Today is {datetime.datetime.now().strftime('%A, %B %d, %Y')}."
+
+    if "take photo" in raw or "capture photo" in raw:
+        return see_camera("Describe this scene.")
+
+    if "screenshot" in cmd: return os_control.screenshot()
+    if "volume up" in cmd: return os_control.volume("up")
+    if "volume down" in cmd: return os_control.volume("down")
+    if "mute" in cmd: return os_control.volume("mute")
+    if "lock pc" in cmd: return os_control.lock_pc()
+    if "system status" in cmd or "diagnostics" in cmd: return os_control.system_stats()
+
+    # 9. PRIORITY 8: File Management
+    if "organize" in cmd and ("downloads" in cmd or "folder" in cmd):
+        import os
+        return organize_folder(os.path.join(os.path.expanduser("~"), "Downloads"))
+
+    # 10. PRIORITY 9: Clipboard AI
+    if "fix my clipboard" in raw: return transform_clipboard("Fix any bugs or errors")
+    if "translate clipboard" in raw: return transform_clipboard("Rewrite as professional English")
+
+    # 11. PRIORITY 10: Task Reminders
+    if "remind me" in raw:
+        m = re.search(r"in (\d+) minute", raw)
+        if m: return add_reminder(raw.replace("remind me", "").strip(), minutes=int(m.group(1)))
+
+    return None
+
+def handle_command(cmd):
+    set_hud("think")
+    play_fx("process")
+
+    # High-Speed Direct System Execution (< 0.02s)
+    direct = execute_direct(cmd)
+    if direct:
+        return direct
+
+    # Intent Classifier for Complex Brain Queries
+    intent = classify_intent(cmd)
+
+    if intent == "VISION_SCREEN":
+        return see_screen(cmd)
+    if intent == "VISION_CAMERA":
+        return see_camera(cmd)
+    if intent == "RAG":
+        from modules.rag_engine import rag_query
+        context = rag_query(cmd)
+        return ask_ai(cmd, extra_context=f"\nKNOWLEDGE BASE:\n{context}")
+    if intent == "WEB_SEARCH":
+        results = web_search(cmd)
+        return ask_ai(cmd, extra_context=f"\nWEB RESULTS:\n{results}")
+
+    return ask_ai(cmd)
 
 def main():
     is_active = False
-    last_interaction = 0
+    last_t = 0
+    name = SYS_CONFIG["assistant_name"]
 
     while True:
         try:
-            current_name = SYS_CONFIG["assistant_name"]
-            if is_active:
-                remaining = int(CONVERSATION_TIMEOUT - (time.time() - last_interaction))
-                if remaining > 0:
-                    print(f"\n🟢 [ACTIVE - {remaining}s left] 🎤 Listening...", end="", flush=True)
-                else:
-                    is_active = False
-                    print(f"\n⚪ [STANDBY] 🎤 Listening for '{current_name}'...", end="", flush=True)
-            else:
-                print(f"\n⚪ [STANDBY] 🎤 Listening for '{current_name}'...", end="", flush=True)
-
-            spoken_text = listen_smart_vad()
-
-            if is_active and (time.time() - last_interaction > CONVERSATION_TIMEOUT):
+            set_hud("idle")
+            if is_active and (time.time() - last_t > CONVERSATION_TIMEOUT):
                 is_active = False
 
-            if not spoken_text or len(spoken_text) < 2: continue
+            print(f"\n{'🟢 ACTIVE' if is_active else '⚪ STANDBY'} 🎤 Listening...", end="", flush=True)
+            set_hud("listen")
 
-            print(f"\r👂 Heard: \"{spoken_text}\"")
+            raw_audio = listen_smart_vad()
+            text = transcribe(raw_audio)
 
-            matched_wake = check_wake_word(spoken_text)
+            if not text or len(text) < 2: continue
+            print(f"\r👂 Heard: \"{text}\"")
+
+            wake = check_wake(text)
             command = None
 
-            if matched_wake:
-                is_active = True
-                last_interaction = time.time()
-                command = re.sub(re.escape(matched_wake), '', spoken_text, flags=re.IGNORECASE).strip(" ,.?!:;")
-                if not command or len(command) < 2: command = f"Hello {current_name}"
+            if wake:
+                is_active = True; last_t = time.time()
+                play_fx("wake")
+                command = re.sub(re.escape(wake), '', text, flags=re.IGNORECASE).strip(" ,.?!:;")
+                if not command or len(command) < 2:
+                    command = f"Hello {name}"
             elif is_active:
-                last_interaction = time.time()
-                command = spoken_text
+                last_t = time.time()
+                command = text
 
             if command:
                 print(f"👤 You: {command}")
-                start_t = time.time()
-                system_reply = parse_and_execute_intent(command)
-                
-                if system_reply:
-                    answer = system_reply
-                    print(f"⚙️ Direct Execution ({time.time() - start_t:.2f}s)")
-                else:
-                    print("🧠 Thinking...", end="", flush=True)
-                    answer = ask_ai(command)
-                    print(f" ({time.time() - start_t:.2f}s)")
-
-                print(f"🤖 {SYS_CONFIG['assistant_name']}: {answer}")
-                speak(answer)
-                last_interaction = time.time()
+                start = time.time()
+                reply = handle_command(command)
+                print(f"🤖 {name} ({time.time()-start:.2f}s): {reply}")
+                set_hud("speak")
+                speak(reply)
+                last_t = time.time()
 
         except KeyboardInterrupt:
-            print(f"\nShutting down {SYS_CONFIG['assistant_name']}. Goodbye {SYS_CONFIG['user_title']}!")
-            break
-        except Exception:
+            print(f"\nGoodbye {SYS_CONFIG['user_title']}!"); break
+        except Exception as e:
+            print(f"\n⚠️ Loop error: {e}")
             continue
 
 if __name__ == "__main__":
